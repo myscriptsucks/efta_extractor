@@ -38,6 +38,7 @@ Reference log:
 
 Other:
   --dry-run           Preview without making changes.
+  -r, --recursive     Search subdirectories recursively.
 
 Requirements:
   pip install pypdf Pillow
@@ -514,6 +515,7 @@ Examples:
   %(prog)s EFTA00000008.pdf --extract-images --organize
   %(prog)s /path/to/pdfs --split --output-dir /tmp/output
   %(prog)s /path/to/pdfs --split --extract-images --dry-run
+  %(prog)s /path/to/pdfs --split -r
         """,
     )
     parser.add_argument(
@@ -540,6 +542,10 @@ Examples:
         "--dry-run", action="store_true",
         help="Preview what would happen without making changes.",
     )
+    parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="Search subdirectories recursively for EFTA PDFs.",
+    )
     args = parser.parse_args()
 
     if not args.split and not args.extract_images:
@@ -559,12 +565,19 @@ Examples:
             sys.exit(1)
         pdf_files = [input_path]
     elif input_path.is_dir():
-        pdf_files = sorted(
-            [f for f in input_path.iterdir() if EFTA_PATTERN.match(f.name)],
-            key=lambda f: f.name,
-        )
+        if args.recursive:
+            pdf_files = sorted(
+                [f for f in input_path.rglob("*.pdf") if EFTA_PATTERN.match(f.name)],
+                key=lambda f: f.name,
+            )
+        else:
+            pdf_files = sorted(
+                [f for f in input_path.iterdir() if EFTA_PATTERN.match(f.name)],
+                key=lambda f: f.name,
+            )
         if not pdf_files:
-            print(f"No EFTA PDF files found in '{input_path}'.")
+            search_type = "recursively in" if args.recursive else "in"
+            print(f"No EFTA PDF files found {search_type} '{input_path}'.")
             sys.exit(0)
     else:
         print(f"Error: '{input_path}' is not a file or directory.", file=sys.stderr)
@@ -584,7 +597,12 @@ Examples:
         mode_parts.append("extract-images")
 
     print(f"Mode: {' + '.join(mode_parts)}")
-    print(f"Input: {input_path} ({len(pdf_files)} file{'s' if len(pdf_files) != 1 else ''})")
+    file_count = len(pdf_files)
+    if args.recursive:
+        dir_count = len(set(f.parent for f in pdf_files))
+        print(f"Input: {input_path} ({file_count} file{'s' if file_count != 1 else ''} across {dir_count} director{'ies' if dir_count != 1 else 'y'}, recursive)")
+    else:
+        print(f"Input: {input_path} ({file_count} file{'s' if file_count != 1 else ''})")
     if output_dir:
         print(f"Output: {output_dir}")
     elif args.organize:

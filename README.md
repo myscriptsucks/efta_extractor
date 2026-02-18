@@ -201,6 +201,7 @@ python efta_tool.py <input> [options]
 |---|---|
 | `--split` | Split multi-page PDFs into one file per page |
 | `--extract-images` | Extract all embedded images in native format |
+| `-r`, `--recursive` | Search subdirectories recursively for EFTA PDFs |
 | `--output-dir PATH` | Send all output to a specific directory |
 | `--organize` | Create a subfolder per EFTA number alongside the source |
 | `--dry-run` | Preview what would happen without making changes |
@@ -263,6 +264,15 @@ python efta_tool.py /path/to/pdfs --extract-images --output-dir /tmp/images
 ```bash
 python efta_tool.py /path/to/pdfs --split --extract-images --dry-run
 ```
+
+**Process all subdirectories recursively:**
+
+```bash
+python efta_tool.py /path/to/pdfs --split -r
+python efta_tool.py /path/to/pdfs --split --extract-images -r
+```
+
+Output files are placed alongside each source PDF in its own directory.
 
 ---
 
@@ -329,4 +339,7 @@ grep "EFTA00000005" efta_reference.json
 
 # Or organized into subfolders
 python efta_tool.py /path/to/efta_pdfs --split --extract-images --organize
+
+# Or recursively through subdirectories
+python efta_tool.py /path/to/efta_pdfs --split --extract-images -r
 ```
