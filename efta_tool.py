@@ -61,6 +61,7 @@ import csv
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,15 @@ def build_stem(prefix: str, number: int) -> str:
 
 
 def ensure_dir(path: Path):
+    """Create directory, handling edge cases gracefully."""
+    if path.is_dir():
+        return
+    if path.exists():
+        raise FileExistsError(
+            f"'{path}' exists but is not a directory. "
+            f"It may be corrupted or a file with the same name. "
+            f"Please remove it or choose a different --output-dir."
+        )
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -113,29 +123,44 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
                         organize: bool) -> set[str]:
     """Determine which source PDFs already have output. Returns filenames to skip."""
     skip_files = set()
+
+    # Build a set of all EFTA stems present in output directories (scan once)
+    existing_stems = set()
+    dirs_to_scan = set()
+
     for filepath in pdf_files:
         parsed = parse_efta_filename(filepath.name)
         if not parsed:
             continue
         prefix, base_number = parsed
         check_dir = resolve_output_dir(filepath, output_dir, organize, prefix, base_number)
-        if not check_dir.is_dir():
+        dirs_to_scan.add(check_dir)
+
+    print(f"Resume: scanning {len(dirs_to_scan)} output director{'ies' if len(dirs_to_scan) != 1 else 'y'}...", end=" ", flush=True)
+
+    for d in dirs_to_scan:
+        if not d.is_dir():
             continue
-        stem = build_stem(prefix, base_number)
-        next_stem = build_stem(prefix, base_number + 1)
         try:
-            for f in check_dir.iterdir():
-                fname = f.name
-                # Check for extracted images (non-pdf with our stem)
-                if fname.startswith(stem) and not fname.endswith('.pdf'):
-                    skip_files.add(filepath.name)
-                    break
-                # Check for split pages (next sequential number exists)
-                if fname.startswith(next_stem):
-                    skip_files.add(filepath.name)
-                    break
+            for f in d.iterdir():
+                match = EFTA_OUTPUT_PATTERN.match(f.name)
+                if match:
+                    existing_stems.add(f"EFTA{match.group(1)}")
         except PermissionError:
             continue
+
+    print(f"found {len(existing_stems)} existing output files.")
+
+    # Now check each source PDF against the pre-built set
+    for filepath in pdf_files:
+        parsed = parse_efta_filename(filepath.name)
+        if not parsed:
+            continue
+        prefix, base_number = parsed
+        stem = build_stem(prefix, base_number)
+        if stem in existing_stems:
+            skip_files.add(filepath.name)
+
     return skip_files
 
 
@@ -375,7 +400,8 @@ def check_pdf_conflicts(dest_dir: Path, prefix: str, base_number: int,
 
 def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 output_dir: Path | None, organize: bool,
-                dry_run: bool, have_pdfimages: bool) -> dict:
+                dry_run: bool, have_pdfimages: bool,
+                shutdown_event: threading.Event | None = None) -> dict:
     """Process a single EFTA PDF file. Returns result dict."""
     filename = filepath.name
     parsed = parse_efta_filename(filename)
@@ -803,42 +829,82 @@ Examples:
              "split_pages": 0, "images": 0, "img_errors": 0}
     stats_lock = threading.Lock()
     printer = Printer()
+    interrupted = False
 
     # Process files
     if args.threads == 1:
         # Single-threaded: simple loop
         for filepath in pdf_files:
-            process_worker(
-                filepath, do_split=args.split, do_images=args.extract_images,
-                output_dir=output_dir, organize=args.organize,
-                dry_run=args.dry_run, have_pdfimages=have_pdfimages,
-                ref_log=ref_log, printer=printer,
-                stats_lock=stats_lock, stats=stats,
-            )
+            try:
+                process_worker(
+                    filepath, do_split=args.split, do_images=args.extract_images,
+                    output_dir=output_dir, organize=args.organize,
+                    dry_run=args.dry_run, have_pdfimages=have_pdfimages,
+                    ref_log=ref_log, printer=printer,
+                    stats_lock=stats_lock, stats=stats,
+                )
+            except KeyboardInterrupt:
+                print("\n\nInterrupted — stopping gracefully...")
+                interrupted = True
+                break
     else:
-        # Multi-threaded
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {
-                executor.submit(
-                    process_worker,
-                    filepath, args.split, args.extract_images,
-                    output_dir, args.organize,
-                    args.dry_run, have_pdfimages,
-                    ref_log, printer, stats_lock, stats,
-                ): filepath
-                for filepath in pdf_files
-            }
-            for future in as_completed(futures):
-                filepath = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    printer.print(f"  [FATAL] {filepath.name} — unhandled exception: {e}")
-                    with stats_lock:
-                        stats["errors"] += 1
+        # Multi-threaded with graceful shutdown
+        shutdown_event = threading.Event()
+
+        def signal_handler(signum, frame):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                shutdown_event.set()
+                print("\n\nInterrupted — finishing in-progress files, please wait...")
+            else:
+                # Second Ctrl+C: force exit
+                print("\nForce quit.")
+                os._exit(1)
+
+        original_handler = signal.signal(signal.SIGINT, signal_handler)
+
+        try:
+            with ThreadPoolExecutor(max_workers=args.threads) as executor:
+                # Submit files in batches so we can stop submitting on interrupt
+                futures = {}
+                for filepath in pdf_files:
+                    if shutdown_event.is_set():
+                        break
+                    future = executor.submit(
+                        process_worker,
+                        filepath, args.split, args.extract_images,
+                        output_dir, args.organize,
+                        args.dry_run, have_pdfimages,
+                        ref_log, printer, stats_lock, stats,
+                    )
+                    futures[future] = filepath
+
+                # Wait for submitted futures
+                for future in as_completed(futures):
+                    if shutdown_event.is_set():
+                        # Cancel any pending futures
+                        for f in futures:
+                            f.cancel()
+                        break
+                    filepath = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        printer.print(f"  [FATAL] {filepath.name} — unhandled exception: {e}")
+                        with stats_lock:
+                            stats["errors"] += 1
+
+                # If interrupted, cancel remaining and don't wait
+                if shutdown_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
 
     # Summary
     print()
+    if interrupted:
+        print("=== INTERRUPTED — partial results below ===")
     if ref_log and ref_log.count:
         print(f"Reference log: {ref_log.csv_path.name}, {ref_log.json_path.name} "
               f"({ref_log.count} total records)")
@@ -858,6 +924,8 @@ Examples:
         print(f"         {stats['images']} images extracted")
     if stats["img_errors"]:
         print(f"         {stats['img_errors']} pages with no extractable image")
+    if interrupted:
+        print("\nUse --resume to continue where you left off.")
 
 
 if __name__ == "__main__":
