@@ -169,69 +169,76 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
 # ---------------------------------------------------------------------------
 
 class ReferenceLog:
-    """Thread-safe incremental reference log writer."""
+    """Thread-safe reference log. Appends to CSV during run, generates JSON at end."""
 
     def __init__(self, log_dir: Path, append: bool = False):
         self.log_dir = log_dir
         self.csv_path = log_dir / "efta_reference.csv"
         self.json_path = log_dir / "efta_reference.json"
         self.lock = threading.Lock()
-        self.records = []
+        self._count = 0
         self.fieldnames = ["output_file", "type", "parent_document", "page", "source_pages"]
 
-        # Load existing records if appending
         if append and self.csv_path.exists():
+            # Count existing rows
             try:
                 with open(self.csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for r in reader:
+                    self._count = sum(1 for _ in csv.DictReader(f))
+            except Exception:
+                pass
+        else:
+            # Write fresh CSV header
+            try:
+                with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writeheader()
+            except Exception:
+                pass
+
+    def add(self, new_records: list[dict]):
+        """Append new rows to CSV."""
+        if not new_records:
+            return
+        with self.lock:
+            try:
+                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    for record in new_records:
+                        writer.writerow(record)
+                self._count += len(new_records)
+            except Exception:
+                pass
+
+    def finalize(self):
+        """Generate JSON from the CSV. Call once at the end."""
+        with self.lock:
+            try:
+                records = []
+                with open(self.csv_path, "r", encoding="utf-8") as f:
+                    for r in csv.DictReader(f):
                         try:
                             r["page"] = int(r["page"])
                             r["source_pages"] = int(r["source_pages"])
                         except (ValueError, KeyError):
                             pass
-                        self.records.append(r)
+                        records.append(r)
+
+                log_data = {
+                    "generated": datetime.now().isoformat(),
+                    "total_files": len(records),
+                    "records": records,
+                }
+                tmp_path = self.json_path.with_suffix(".json.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(log_data, f, indent=2)
+                tmp_path.replace(self.json_path)
             except Exception:
                 pass
-
-        # Initialize CSV with header (or rewrite existing)
-        self._write_all()
-
-    def add(self, new_records: list[dict]):
-        """Add records and immediately flush to disk."""
-        if not new_records:
-            return
-        with self.lock:
-            self.records.extend(new_records)
-            self._write_all()
-
-    def _write_all(self):
-        """Write all records to CSV and JSON. Called under lock."""
-        # CSV
-        try:
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                writer.writeheader()
-                writer.writerows(self.records)
-        except Exception:
-            pass
-
-        # JSON
-        try:
-            log_data = {
-                "generated": datetime.now().isoformat(),
-                "total_files": len(self.records),
-                "records": self.records,
-            }
-            with open(self.json_path, "w", encoding="utf-8") as f:
-                json.dump(log_data, f, indent=2)
-        except Exception:
-            pass
 
     @property
     def count(self):
         with self.lock:
-            return len(self.records)
+            return self._count
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +907,10 @@ Examples:
                     executor.shutdown(wait=False, cancel_futures=True)
         finally:
             signal.signal(signal.SIGINT, original_handler)
+
+    # Finalize reference log — generate JSON from CSV
+    if ref_log:
+        ref_log.finalize()
 
     # Summary
     print()
