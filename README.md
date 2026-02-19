@@ -72,7 +72,7 @@ Every run automatically generates `efta_reference.csv` and `efta_reference.json`
 }
 ```
 
-The log is saved in the output directory (or the source directory if no output dir is specified). It is not generated during `--dry-run`.
+The log is saved in the output directory (or the source directory if no output dir is specified). It is written **incrementally after each file** so that progress is preserved if the script is interrupted. It is not generated during `--dry-run`.
 
 ---
 
@@ -202,6 +202,8 @@ python efta_tool.py <input> [options]
 | `--split` | Split multi-page PDFs into one file per page |
 | `--extract-images` | Extract all embedded images in native format |
 | `-r`, `--recursive` | Search subdirectories recursively for EFTA PDFs |
+| `--resume` | Skip files that already have output in the destination |
+| `--threads N` | Process N files in parallel (default: 1) |
 | `--output-dir PATH` | Send all output to a specific directory |
 | `--organize` | Create a subfolder per EFTA number alongside the source |
 | `--dry-run` | Preview what would happen without making changes |
@@ -273,6 +275,23 @@ python efta_tool.py /path/to/pdfs --split --extract-images -r
 ```
 
 Output files are placed alongside each source PDF in its own directory.
+
+**Resume after an interruption:**
+
+```bash
+python efta_tool.py /path/to/pdfs --extract-images --resume
+```
+
+The `--resume` flag scans the output directory for existing EFTA files and skips any source PDFs that already have output present. The reference log is appended to rather than overwritten. This is useful for large datasets where the script may be interrupted or encounter errors partway through.
+
+**Process with multiple threads:**
+
+```bash
+python efta_tool.py /path/to/pdfs --extract-images --threads 8
+python efta_tool.py /path/to/pdfs --split --extract-images --threads 4 --resume
+```
+
+Thread count should generally match your CPU core count. Console output and reference log writes are thread-safe.
 
 ---
 

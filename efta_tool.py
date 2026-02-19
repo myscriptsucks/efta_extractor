@@ -33,12 +33,14 @@ Naming conventions:
     EFTA00000004[2].png
 
 Reference log:
-  Automatically generates efta_reference.csv and efta_reference.json
-  mapping every output file back to its parent document and page number.
+  Automatically generates efta_reference.csv and efta_reference.json.
+  Written incrementally after each file to prevent data loss on crash.
 
 Other:
   --dry-run           Preview without making changes.
   -r, --recursive     Search subdirectories recursively.
+  --resume            Skip files already processed (auto-detects from output).
+  --threads N         Process N files in parallel (default: 1).
 
 Requirements:
   pip install pypdf Pillow
@@ -49,6 +51,9 @@ Examples:
   python efta_tool.py EFTA00000008.pdf --extract-images --organize
   python efta_tool.py /path/to/pdfs --split --extract-images --output-dir /path/to/output
   python efta_tool.py /path/to/pdfs --split --extract-images --dry-run
+  python efta_tool.py /path/to/pdfs --split -r
+  python efta_tool.py /path/to/pdfs --extract-images --resume
+  python efta_tool.py /path/to/pdfs --extract-images --threads 8
 """
 
 import argparse
@@ -59,6 +64,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -66,6 +74,7 @@ from pypdf import PdfReader, PdfWriter
 
 
 EFTA_PATTERN = re.compile(r'^(EFTA)(\d{8})\.pdf$', re.IGNORECASE)
+EFTA_OUTPUT_PATTERN = re.compile(r'^EFTA(\d{8})(?:\[\d+\])?\.\w+$', re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +107,122 @@ def resolve_output_dir(source_pdf: Path, output_dir: Path | None,
     if organize:
         return source_pdf.parent / build_stem(prefix, base_number)
     return source_pdf.parent
+
+
+def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
+                        organize: bool) -> set[str]:
+    """Determine which source PDFs already have output. Returns filenames to skip."""
+    skip_files = set()
+    for filepath in pdf_files:
+        parsed = parse_efta_filename(filepath.name)
+        if not parsed:
+            continue
+        prefix, base_number = parsed
+        check_dir = resolve_output_dir(filepath, output_dir, organize, prefix, base_number)
+        if not check_dir.is_dir():
+            continue
+        stem = build_stem(prefix, base_number)
+        next_stem = build_stem(prefix, base_number + 1)
+        try:
+            for f in check_dir.iterdir():
+                fname = f.name
+                # Check for extracted images (non-pdf with our stem)
+                if fname.startswith(stem) and not fname.endswith('.pdf'):
+                    skip_files.add(filepath.name)
+                    break
+                # Check for split pages (next sequential number exists)
+                if fname.startswith(next_stem):
+                    skip_files.add(filepath.name)
+                    break
+        except PermissionError:
+            continue
+    return skip_files
+
+
+# ---------------------------------------------------------------------------
+# Incremental reference log writer (thread-safe)
+# ---------------------------------------------------------------------------
+
+class ReferenceLog:
+    """Thread-safe incremental reference log writer."""
+
+    def __init__(self, log_dir: Path, append: bool = False):
+        self.log_dir = log_dir
+        self.csv_path = log_dir / "efta_reference.csv"
+        self.json_path = log_dir / "efta_reference.json"
+        self.lock = threading.Lock()
+        self.records = []
+        self.fieldnames = ["output_file", "type", "parent_document", "page", "source_pages"]
+
+        # Load existing records if appending
+        if append and self.csv_path.exists():
+            try:
+                with open(self.csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        try:
+                            r["page"] = int(r["page"])
+                            r["source_pages"] = int(r["source_pages"])
+                        except (ValueError, KeyError):
+                            pass
+                        self.records.append(r)
+            except Exception:
+                pass
+
+        # Initialize CSV with header (or rewrite existing)
+        self._write_all()
+
+    def add(self, new_records: list[dict]):
+        """Add records and immediately flush to disk."""
+        if not new_records:
+            return
+        with self.lock:
+            self.records.extend(new_records)
+            self._write_all()
+
+    def _write_all(self):
+        """Write all records to CSV and JSON. Called under lock."""
+        # CSV
+        try:
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+                writer.writerows(self.records)
+        except Exception:
+            pass
+
+        # JSON
+        try:
+            log_data = {
+                "generated": datetime.now().isoformat(),
+                "total_files": len(self.records),
+                "records": self.records,
+            }
+            with open(self.json_path, "w", encoding="utf-8") as f:
+                json.dump(log_data, f, indent=2)
+        except Exception:
+            pass
+
+    @property
+    def count(self):
+        with self.lock:
+            return len(self.records)
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe console printer
+# ---------------------------------------------------------------------------
+
+class Printer:
+    """Thread-safe console output."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def print(self, *args, **kwargs):
+        with self.lock:
+            print(*args, **kwargs)
+            sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -199,32 +324,28 @@ def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
 def extract_images_pdfimages(pdf_path: Path, efta_stem: str, dest_dir: Path) -> list[str]:
     """Fallback: extract images using pdfimages (poppler-utils)."""
     extracted = []
-    tmp_prefix = str(dest_dir / f"{efta_stem}__pdfimg")
     try:
-        subprocess.run(
-            ["pdfimages", "-all", str(pdf_path), tmp_prefix],
-            capture_output=True, timeout=30,
-        )
-        tmp_name = Path(tmp_prefix).name
-        candidates = sorted(dest_dir.glob(f"{tmp_name}-*"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_prefix = os.path.join(tmpdir, "img")
+            subprocess.run(
+                ["pdfimages", "-all", str(pdf_path), tmp_prefix],
+                capture_output=True, timeout=30,
+            )
+            candidates = sorted(Path(tmpdir).glob("img-*"))
 
-        if len(candidates) == 1:
-            src = candidates[0]
-            final_name = f"{efta_stem}{src.suffix}"
-            shutil.move(str(src), str(dest_dir / final_name))
-            extracted.append(final_name)
-        else:
-            for idx, src in enumerate(candidates, start=1):
-                ext = src.suffix
-                final_name = f"{efta_stem}[{idx}]{ext}"
+            if len(candidates) == 1:
+                src = candidates[0]
+                final_name = f"{efta_stem}{src.suffix}"
                 shutil.move(str(src), str(dest_dir / final_name))
                 extracted.append(final_name)
+            else:
+                for idx, src in enumerate(candidates, start=1):
+                    ext = src.suffix
+                    final_name = f"{efta_stem}[{idx}]{ext}"
+                    shutil.move(str(src), str(dest_dir / final_name))
+                    extracted.append(final_name)
     except Exception:
         pass
-    finally:
-        tmp_name_clean = Path(f"{efta_stem}__pdfimg").name
-        for leftover in dest_dir.glob(f"{tmp_name_clean}-*"):
-            leftover.unlink(missing_ok=True)
     return extracted
 
 
@@ -236,40 +357,6 @@ def extract_images(page, pdf_path: Path, efta_stem: str,
     if have_pdfimages:
         return extract_images_pdfimages(pdf_path, efta_stem, dest_dir)
     return []
-
-
-# ---------------------------------------------------------------------------
-# Reference log
-# ---------------------------------------------------------------------------
-
-def write_reference_log(records: list[dict], dest_dir: Path):
-    """
-    Write efta_reference.csv and efta_reference.json to dest_dir.
-    Each record: {output_file, type, parent_document, page, source_pages}
-    """
-    if not records:
-        return
-
-    csv_path = dest_dir / "efta_reference.csv"
-    json_path = dest_dir / "efta_reference.json"
-
-    # CSV
-    fieldnames = ["output_file", "type", "parent_document", "page", "source_pages"]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(records)
-
-    # JSON
-    log_data = {
-        "generated": datetime.now().isoformat(),
-        "total_files": len(records),
-        "records": records,
-    }
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(log_data, f, indent=2)
-
-    print(f"Reference log: {csv_path.name}, {json_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +432,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 writer.add_page(reader.pages[i])
                 out_name = build_efta_filename(prefix, base_number + i)
                 out_path = dest_dir / out_name
-                with open(out_path, "wb") as f:
+                with open(str(out_path), "wb") as f:
                     writer.write(f)
                 split_files.append(out_name)
 
@@ -362,11 +449,11 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
             writer.add_page(reader.pages[0])
             page1_path = dest_dir / filename
             if dest_dir == filepath.parent:
-                with open(filepath, "wb") as f:
+                with open(str(filepath), "wb") as f:
                     writer.write(f)
                 page1_path = filepath
             else:
-                with open(page1_path, "wb") as f:
+                with open(str(page1_path), "wb") as f:
                     writer.write(f)
             split_files.insert(0, filename)
 
@@ -402,14 +489,17 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 stem = build_stem(prefix, page_number)
 
                 if page_count > 1:
-                    tmp_path = dest_dir / f".tmp_{stem}.pdf"
-                    tmp_writer = PdfWriter()
-                    tmp_writer.add_page(reader.pages[page_idx])
-                    with open(tmp_path, "wb") as f:
-                        tmp_writer.write(f)
-                    imgs = extract_images(reader.pages[page_idx], tmp_path, stem,
-                                          dest_dir, have_pdfimages)
-                    tmp_path.unlink(missing_ok=True)
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp_path = Path(tmp.name)
+                    try:
+                        tmp_writer = PdfWriter()
+                        tmp_writer.add_page(reader.pages[page_idx])
+                        with open(str(tmp_path), "wb") as f:
+                            tmp_writer.write(f)
+                        imgs = extract_images(reader.pages[page_idx], tmp_path, stem,
+                                              dest_dir, have_pdfimages)
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
                 else:
                     imgs = extract_images(reader.pages[page_idx], filepath, stem,
                                           dest_dir, have_pdfimages)
@@ -451,10 +541,6 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
 # ---------------------------------------------------------------------------
 
 def build_reference_records(result: dict) -> list[dict]:
-    """
-    Build reference log records from a process_pdf result.
-    Maps every output file back to the parent document and page number.
-    """
     records = []
     filename = result["file"]
     page_count = result.get("pages", 1)
@@ -463,7 +549,6 @@ def build_reference_records(result: dict) -> list[dict]:
         return records
     prefix, base_number = parsed
 
-    # Split pages
     for split_file in result.get("split_files", []):
         split_parsed = parse_efta_filename(split_file)
         if split_parsed:
@@ -479,9 +564,7 @@ def build_reference_records(result: dict) -> list[dict]:
             "source_pages": page_count,
         })
 
-    # Images
     for img_file in result.get("image_files", []):
-        # Parse the EFTA number from the image filename
         img_match = re.match(r'(EFTA)(\d{8})', img_file, re.IGNORECASE)
         if img_match:
             img_num = int(img_match.group(2))
@@ -497,6 +580,68 @@ def build_reference_records(result: dict) -> list[dict]:
         })
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Worker function for threading
+# ---------------------------------------------------------------------------
+
+def process_worker(filepath: Path, do_split: bool, do_images: bool,
+                   output_dir: Path | None, organize: bool,
+                   dry_run: bool, have_pdfimages: bool,
+                   ref_log: ReferenceLog | None, printer: Printer,
+                   stats_lock: threading.Lock, stats: dict):
+    """Worker that processes one file, updates log and stats."""
+    result = process_pdf(
+        filepath, do_split=do_split, do_images=do_images,
+        output_dir=output_dir, organize=organize,
+        dry_run=dry_run, have_pdfimages=have_pdfimages,
+    )
+
+    status = result["status"]
+
+    # Build output lines
+    lines = []
+
+    if status in ("processed", "dry-run"):
+        # Write reference log immediately
+        if status == "processed" and ref_log:
+            records = build_reference_records(result)
+            ref_log.add(records)
+
+        dest_note = ""
+        if result.get("dest") and (output_dir or organize):
+            dest_note = f" → {result['dest']}"
+        page_info = f" ({result.get('pages', '?')} pages)" if result.get("pages", 1) > 1 else ""
+        lines.append(f"  [OK]    {result['file']}{page_info}{dest_note}")
+
+        if "split_files" in result:
+            for name in result["split_files"]:
+                lines.append(f"          -> {name}")
+        if "image_files" in result:
+            for img in result["image_files"]:
+                lines.append(f"          -> {img}  (image)")
+        if result.get("image_errors"):
+            lines.append(f"          ({result['image_errors']} page(s) had no extractable image)")
+
+        with stats_lock:
+            stats["processed"] += 1
+            stats["split_pages"] += len(result.get("split_files", []))
+            stats["images"] += len(result.get("image_files", []))
+            stats["img_errors"] += result.get("image_errors", 0)
+
+    elif status == "skipped":
+        lines.append(f"  [SKIP]  {result['file']} — {result['reason']}")
+        with stats_lock:
+            stats["skipped"] += 1
+
+    elif status == "error":
+        lines.append(f"  [ERROR] {result['file']} — {result['reason']}")
+        with stats_lock:
+            stats["errors"] += 1
+
+    # Print all lines atomically
+    printer.print("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +661,8 @@ Examples:
   %(prog)s /path/to/pdfs --split --output-dir /tmp/output
   %(prog)s /path/to/pdfs --split --extract-images --dry-run
   %(prog)s /path/to/pdfs --split -r
+  %(prog)s /path/to/pdfs --extract-images --resume
+  %(prog)s /path/to/pdfs --extract-images --threads 8
         """,
     )
     parser.add_argument(
@@ -546,6 +693,14 @@ Examples:
         "-r", "--recursive", action="store_true",
         help="Search subdirectories recursively for EFTA PDFs.",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip files that already have output in the destination directory.",
+    )
+    parser.add_argument(
+        "--threads", type=int, default=1,
+        help="Number of parallel threads (default: 1).",
+    )
     args = parser.parse_args()
 
     if not args.split and not args.extract_images:
@@ -553,6 +708,9 @@ Examples:
 
     if args.output_dir and args.organize:
         parser.error("Use --output-dir or --organize, not both.")
+
+    if args.threads < 1:
+        parser.error("--threads must be at least 1.")
 
     input_path = Path(args.input).resolve()
     if not input_path.exists():
@@ -587,6 +745,19 @@ Examples:
     if output_dir:
         ensure_dir(output_dir)
 
+    # Resume
+    skipped_resume = set()
+    if args.resume and not args.dry_run:
+        skipped_resume = detect_resume_point(pdf_files, output_dir, args.organize)
+        if skipped_resume:
+            original_count = len(pdf_files)
+            pdf_files = [f for f in pdf_files if f.name not in skipped_resume]
+            print(f"Resume: skipping {len(skipped_resume)} already-processed file(s), "
+                  f"{len(pdf_files)} remaining of {original_count}")
+            if not pdf_files:
+                print("Nothing left to process.")
+                sys.exit(0)
+
     have_pdfimages = shutil.which("pdfimages") is not None
 
     # Header
@@ -600,7 +771,8 @@ Examples:
     file_count = len(pdf_files)
     if args.recursive:
         dir_count = len(set(f.parent for f in pdf_files))
-        print(f"Input: {input_path} ({file_count} file{'s' if file_count != 1 else ''} across {dir_count} director{'ies' if dir_count != 1 else 'y'}, recursive)")
+        print(f"Input: {input_path} ({file_count} file{'s' if file_count != 1 else ''} "
+              f"across {dir_count} director{'ies' if dir_count != 1 else 'y'}, recursive)")
     else:
         print(f"Input: {input_path} ({file_count} file{'s' if file_count != 1 else ''})")
     if output_dir:
@@ -609,80 +781,67 @@ Examples:
         print(f"Output: organized subfolders alongside source")
     else:
         print(f"Output: same directory as source")
+    if args.threads > 1:
+        print(f"Threads: {args.threads}")
     if args.extract_images and have_pdfimages:
         print(f"Fallback extractor: pdfimages available")
     if args.dry_run:
         print("=== DRY RUN MODE ===")
     print()
 
-    # Process
-    stats = {"processed": 0, "skipped": 0, "errors": 0,
-             "split_pages": 0, "images": 0, "img_errors": 0}
-    all_ref_records = []
-
-    for filepath in pdf_files:
-        result = process_pdf(
-            filepath,
-            do_split=args.split,
-            do_images=args.extract_images,
-            output_dir=output_dir,
-            organize=args.organize,
-            dry_run=args.dry_run,
-            have_pdfimages=have_pdfimages,
-        )
-
-        status = result["status"]
-
-        if status in ("processed", "dry-run"):
-            stats["processed"] += 1
-
-            # Build reference records
-            if status == "processed":
-                all_ref_records.extend(build_reference_records(result))
-
-            dest_note = ""
-            if result.get("dest") and (output_dir or args.organize):
-                dest_note = f" → {result['dest']}"
-
-            page_info = f" ({result.get('pages', '?')} pages)" if result.get("pages", 1) > 1 else ""
-            print(f"  [OK]    {result['file']}{page_info}{dest_note}")
-
-            if "split_files" in result:
-                stats["split_pages"] += len(result["split_files"])
-                for name in result["split_files"]:
-                    print(f"          -> {name}")
-
-            if "image_files" in result:
-                stats["images"] += len(result["image_files"])
-                for img in result["image_files"]:
-                    print(f"          -> {img}  (image)")
-
-            if result.get("image_errors"):
-                stats["img_errors"] += result["image_errors"]
-                print(f"          ({result['image_errors']} page(s) had no extractable image)")
-
-        elif status == "skipped":
-            stats["skipped"] += 1
-            print(f"  [SKIP]  {result['file']} — {result['reason']}")
-
-        elif status == "error":
-            stats["errors"] += 1
-            print(f"  [ERROR] {result['file']} — {result['reason']}")
-
-    # Write reference log
-    if all_ref_records and not args.dry_run:
-        # Determine where to write the log
+    # Initialize reference log (writes incrementally)
+    ref_log = None
+    if not args.dry_run:
         if output_dir:
             log_dir = output_dir
-        elif args.organize:
-            # Put log in the parent directory (alongside the subfolders)
-            log_dir = input_path if input_path.is_dir() else input_path.parent
         else:
             log_dir = input_path if input_path.is_dir() else input_path.parent
-        write_reference_log(all_ref_records, log_dir)
+        ref_log = ReferenceLog(log_dir, append=args.resume)
+
+    # Stats
+    stats = {"processed": 0, "skipped": 0, "errors": 0,
+             "split_pages": 0, "images": 0, "img_errors": 0}
+    stats_lock = threading.Lock()
+    printer = Printer()
+
+    # Process files
+    if args.threads == 1:
+        # Single-threaded: simple loop
+        for filepath in pdf_files:
+            process_worker(
+                filepath, do_split=args.split, do_images=args.extract_images,
+                output_dir=output_dir, organize=args.organize,
+                dry_run=args.dry_run, have_pdfimages=have_pdfimages,
+                ref_log=ref_log, printer=printer,
+                stats_lock=stats_lock, stats=stats,
+            )
+    else:
+        # Multi-threaded
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = {
+                executor.submit(
+                    process_worker,
+                    filepath, args.split, args.extract_images,
+                    output_dir, args.organize,
+                    args.dry_run, have_pdfimages,
+                    ref_log, printer, stats_lock, stats,
+                ): filepath
+                for filepath in pdf_files
+            }
+            for future in as_completed(futures):
+                filepath = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    printer.print(f"  [FATAL] {filepath.name} — unhandled exception: {e}")
+                    with stats_lock:
+                        stats["errors"] += 1
 
     # Summary
     print()
+    if ref_log and ref_log.count:
+        print(f"Reference log: {ref_log.csv_path.name}, {ref_log.json_path.name} "
+              f"({ref_log.count} total records)")
     parts = []
     if stats["processed"]:
         parts.append(f"{stats['processed']} processed")
@@ -690,6 +849,8 @@ Examples:
         parts.append(f"{stats['skipped']} skipped")
     if stats["errors"]:
         parts.append(f"{stats['errors']} errors")
+    if skipped_resume:
+        parts.append(f"{len(skipped_resume)} resumed-over")
     print(f"Summary: {', '.join(parts)}")
     if stats["split_pages"]:
         print(f"         {stats['split_pages']} split page files")
