@@ -34,13 +34,13 @@ Naming conventions:
 
 Reference log:
   Automatically generates efta_reference.csv and efta_reference.json.
-  Written incrementally after each file to prevent data loss on crash.
+  CSV is written incrementally; JSON is generated from CSV at the end.
 
 Other:
   --dry-run           Preview without making changes.
   -r, --recursive     Search subdirectories recursively.
   --resume            Skip files already processed (auto-detects from output).
-  --threads N         Process N files in parallel (default: 1).
+  --workers N         Process N files in parallel using multiple CPU cores (default: 1).
 
 Requirements:
   pip install pypdf Pillow
@@ -53,7 +53,7 @@ Examples:
   python efta_tool.py /path/to/pdfs --split --extract-images --dry-run
   python efta_tool.py /path/to/pdfs --split -r
   python efta_tool.py /path/to/pdfs --extract-images --resume
-  python efta_tool.py /path/to/pdfs --extract-images --threads 8
+  python efta_tool.py /path/to/pdfs --extract-images --workers 8
 """
 
 import argparse
@@ -61,13 +61,12 @@ import csv
 import json
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -124,10 +123,9 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
     """Determine which source PDFs already have output. Returns filenames to skip."""
     skip_files = set()
 
-    # Build a set of all EFTA stems present in output directories (scan once)
-    existing_stems = set()
+    # Build a set of dirs to scan
     dirs_to_scan = set()
-
+    file_to_check = {}
     for filepath in pdf_files:
         parsed = parse_efta_filename(filepath.name)
         if not parsed:
@@ -135,9 +133,11 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
         prefix, base_number = parsed
         check_dir = resolve_output_dir(filepath, output_dir, organize, prefix, base_number)
         dirs_to_scan.add(check_dir)
+        stem = build_stem(prefix, base_number)
+        file_to_check[filepath.name] = (stem, build_stem(prefix, base_number + 1))
 
-    print(f"Resume: scanning {len(dirs_to_scan)} output director{'ies' if len(dirs_to_scan) != 1 else 'y'}...", end=" ", flush=True)
-
+    # Scan all relevant dirs once
+    existing_stems = set()
     for d in dirs_to_scan:
         if not d.is_dir():
             continue
@@ -149,48 +149,39 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
         except PermissionError:
             continue
 
-    print(f"found {len(existing_stems)} existing output files.")
-
-    # Now check each source PDF against the pre-built set
-    for filepath in pdf_files:
-        parsed = parse_efta_filename(filepath.name)
-        if not parsed:
-            continue
-        prefix, base_number = parsed
-        stem = build_stem(prefix, base_number)
+    # Check each source against existing
+    for fname, (stem, next_stem) in file_to_check.items():
         if stem in existing_stems:
-            skip_files.add(filepath.name)
+            skip_files.add(fname)
 
     return skip_files
 
 
 # ---------------------------------------------------------------------------
-# Incremental reference log writer (thread-safe)
+# Reference log — CSV append, JSON at end
 # ---------------------------------------------------------------------------
 
 class ReferenceLog:
-    """Thread-safe reference log. Appends to CSV during run, generates JSON at end."""
+    """Appends to CSV during run, generates JSON at end."""
+
+    FIELDNAMES = ["output_file", "type", "parent_document", "page", "source_pages"]
 
     def __init__(self, log_dir: Path, append: bool = False):
         self.log_dir = log_dir
         self.csv_path = log_dir / "efta_reference.csv"
         self.json_path = log_dir / "efta_reference.json"
-        self.lock = threading.Lock()
         self._count = 0
-        self.fieldnames = ["output_file", "type", "parent_document", "page", "source_pages"]
 
         if append and self.csv_path.exists():
-            # Count existing rows
             try:
                 with open(self.csv_path, "r", encoding="utf-8") as f:
                     self._count = sum(1 for _ in csv.DictReader(f))
             except Exception:
                 pass
         else:
-            # Write fresh CSV header
             try:
                 with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
                     writer.writeheader()
             except Exception:
                 pass
@@ -199,62 +190,42 @@ class ReferenceLog:
         """Append new rows to CSV."""
         if not new_records:
             return
-        with self.lock:
-            try:
-                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                    for record in new_records:
-                        writer.writerow(record)
-                self._count += len(new_records)
-            except Exception:
-                pass
+        try:
+            with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
+                for record in new_records:
+                    writer.writerow(record)
+            self._count += len(new_records)
+        except Exception:
+            pass
 
     def finalize(self):
         """Generate JSON from the CSV. Call once at the end."""
-        with self.lock:
-            try:
-                records = []
-                with open(self.csv_path, "r", encoding="utf-8") as f:
-                    for r in csv.DictReader(f):
-                        try:
-                            r["page"] = int(r["page"])
-                            r["source_pages"] = int(r["source_pages"])
-                        except (ValueError, KeyError):
-                            pass
-                        records.append(r)
-
-                log_data = {
-                    "generated": datetime.now().isoformat(),
-                    "total_files": len(records),
-                    "records": records,
-                }
-                tmp_path = self.json_path.with_suffix(".json.tmp")
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(log_data, f, indent=2)
-                tmp_path.replace(self.json_path)
-            except Exception:
-                pass
+        try:
+            records = []
+            with open(self.csv_path, "r", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    try:
+                        r["page"] = int(r["page"])
+                        r["source_pages"] = int(r["source_pages"])
+                    except (ValueError, KeyError):
+                        pass
+                    records.append(r)
+            log_data = {
+                "generated": datetime.now().isoformat(),
+                "total_files": len(records),
+                "records": records,
+            }
+            tmp_path = self.json_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(log_data, f, indent=2)
+            tmp_path.replace(self.json_path)
+        except Exception:
+            pass
 
     @property
     def count(self):
-        with self.lock:
-            return self._count
-
-
-# ---------------------------------------------------------------------------
-# Thread-safe console printer
-# ---------------------------------------------------------------------------
-
-class Printer:
-    """Thread-safe console output."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-
-    def print(self, *args, **kwargs):
-        with self.lock:
-            print(*args, **kwargs)
-            sys.stdout.flush()
+        return self._count
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +245,6 @@ def get_image_ext(filter_name: str) -> str:
 
 
 def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
-    """
-    Extract ALL embedded images from a PDF page using pypdf.
-    Single image → EFTA########.ext
-    Multiple    → EFTA########[1].ext, EFTA########[2].ext, ...
-    """
     image_objects = []
     try:
         resources = page.get("/Resources")
@@ -310,14 +276,12 @@ def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
             final_name = f"{efta_stem}[{idx}]{ext}" if multi else f"{efta_stem}{ext}"
             output_path = dest_dir / final_name
 
-            # JPEG/JP2: raw bytes
             if filter_name in ("/DCTDecode", "/JPXDecode"):
                 with open(str(output_path), "wb") as f:
                     f.write(obj._data)
                 extracted.append(final_name)
                 continue
 
-            # Other: decode via PIL
             from PIL import Image
 
             width = int(obj["/Width"])
@@ -354,7 +318,6 @@ def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
 
 
 def extract_images_pdfimages(pdf_path: Path, efta_stem: str, dest_dir: Path) -> list[str]:
-    """Fallback: extract images using pdfimages (poppler-utils)."""
     extracted = []
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -392,7 +355,7 @@ def extract_images(page, pdf_path: Path, efta_stem: str,
 
 
 # ---------------------------------------------------------------------------
-# Core operations
+# Core: process a single PDF (runs in worker process)
 # ---------------------------------------------------------------------------
 
 def check_pdf_conflicts(dest_dir: Path, prefix: str, base_number: int,
@@ -407,9 +370,8 @@ def check_pdf_conflicts(dest_dir: Path, prefix: str, base_number: int,
 
 def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 output_dir: Path | None, organize: bool,
-                dry_run: bool, have_pdfimages: bool,
-                shutdown_event: threading.Event | None = None) -> dict:
-    """Process a single EFTA PDF file. Returns result dict."""
+                dry_run: bool, have_pdfimages: bool) -> dict:
+    """Process a single EFTA PDF. Returns a serializable result dict."""
     filename = filepath.name
     parsed = parse_efta_filename(filename)
     if not parsed:
@@ -448,9 +410,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
     image_files = []
     img_errors = 0
 
-    # =======================================================================
-    # MODE: Split + optionally extract images
-    # =======================================================================
+    # === Split + optionally extract images ===
     if do_split and page_count > 1:
         conflicts = check_pdf_conflicts(dest_dir, prefix, base_number, page_count)
         if conflicts:
@@ -512,9 +472,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                         pass
             return {"file": filename, "status": "error", "reason": f"failed during split: {e}"}
 
-    # =======================================================================
-    # MODE: Extract images only (no split)
-    # =======================================================================
+    # === Extract images only (no split) ===
     elif do_images and not do_split:
         try:
             for page_idx in range(page_count):
@@ -545,9 +503,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
         except Exception as e:
             return {"file": filename, "status": "error", "reason": f"image extraction failed: {e}"}
 
-    # =======================================================================
-    # MODE: Split only, single page
-    # =======================================================================
+    # === Split only, single page ===
     elif do_split and page_count <= 1:
         if dest_dir != filepath.parent:
             shutil.copy2(str(filepath), str(dest_dir / filename))
@@ -570,7 +526,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
 
 
 # ---------------------------------------------------------------------------
-# Build reference records from a process result
+# Build reference records from a result
 # ---------------------------------------------------------------------------
 
 def build_reference_records(result: dict) -> list[dict]:
@@ -616,28 +572,16 @@ def build_reference_records(result: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Worker function for threading
+# Handle a result from a worker (runs in main process)
 # ---------------------------------------------------------------------------
 
-def process_worker(filepath: Path, do_split: bool, do_images: bool,
-                   output_dir: Path | None, organize: bool,
-                   dry_run: bool, have_pdfimages: bool,
-                   ref_log: ReferenceLog | None, printer: Printer,
-                   stats_lock: threading.Lock, stats: dict):
-    """Worker that processes one file, updates log and stats."""
-    result = process_pdf(
-        filepath, do_split=do_split, do_images=do_images,
-        output_dir=output_dir, organize=organize,
-        dry_run=dry_run, have_pdfimages=have_pdfimages,
-    )
-
+def handle_result(result: dict, ref_log: ReferenceLog | None,
+                  output_dir: Path | None, organize: bool,
+                  stats: dict):
+    """Print result, update stats, write to ref log. Runs in main process."""
     status = result["status"]
 
-    # Build output lines
-    lines = []
-
     if status in ("processed", "dry-run"):
-        # Write reference log immediately
         if status == "processed" and ref_log:
             records = build_reference_records(result)
             ref_log.add(records)
@@ -646,35 +590,31 @@ def process_worker(filepath: Path, do_split: bool, do_images: bool,
         if result.get("dest") and (output_dir or organize):
             dest_note = f" → {result['dest']}"
         page_info = f" ({result.get('pages', '?')} pages)" if result.get("pages", 1) > 1 else ""
-        lines.append(f"  [OK]    {result['file']}{page_info}{dest_note}")
+        print(f"  [OK]    {result['file']}{page_info}{dest_note}")
 
         if "split_files" in result:
             for name in result["split_files"]:
-                lines.append(f"          -> {name}")
+                print(f"          -> {name}")
         if "image_files" in result:
             for img in result["image_files"]:
-                lines.append(f"          -> {img}  (image)")
+                print(f"          -> {img}  (image)")
         if result.get("image_errors"):
-            lines.append(f"          ({result['image_errors']} page(s) had no extractable image)")
+            print(f"          ({result['image_errors']} page(s) had no extractable image)")
 
-        with stats_lock:
-            stats["processed"] += 1
-            stats["split_pages"] += len(result.get("split_files", []))
-            stats["images"] += len(result.get("image_files", []))
-            stats["img_errors"] += result.get("image_errors", 0)
+        stats["processed"] += 1
+        stats["split_pages"] += len(result.get("split_files", []))
+        stats["images"] += len(result.get("image_files", []))
+        stats["img_errors"] += result.get("image_errors", 0)
 
     elif status == "skipped":
-        lines.append(f"  [SKIP]  {result['file']} — {result['reason']}")
-        with stats_lock:
-            stats["skipped"] += 1
+        print(f"  [SKIP]  {result['file']} — {result['reason']}")
+        stats["skipped"] += 1
 
     elif status == "error":
-        lines.append(f"  [ERROR] {result['file']} — {result['reason']}")
-        with stats_lock:
-            stats["errors"] += 1
+        print(f"  [ERROR] {result['file']} — {result['reason']}")
+        stats["errors"] += 1
 
-    # Print all lines atomically
-    printer.print("\n".join(lines))
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +635,7 @@ Examples:
   %(prog)s /path/to/pdfs --split --extract-images --dry-run
   %(prog)s /path/to/pdfs --split -r
   %(prog)s /path/to/pdfs --extract-images --resume
-  %(prog)s /path/to/pdfs --extract-images --threads 8
+  %(prog)s /path/to/pdfs --extract-images --workers 8
         """,
     )
     parser.add_argument(
@@ -731,8 +671,9 @@ Examples:
         help="Skip files that already have output in the destination directory.",
     )
     parser.add_argument(
-        "--threads", type=int, default=1,
-        help="Number of parallel threads (default: 1).",
+        "--workers", type=int, default=1,
+        help=f"Number of parallel worker processes (default: 1). "
+             f"Your system has {os.cpu_count()} cores.",
     )
     args = parser.parse_args()
 
@@ -742,8 +683,13 @@ Examples:
     if args.output_dir and args.organize:
         parser.error("Use --output-dir or --organize, not both.")
 
-    if args.threads < 1:
-        parser.error("--threads must be at least 1.")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1.")
+
+    cpu_count = os.cpu_count() or 1
+    if args.workers > cpu_count:
+        print(f"Warning: --workers {args.workers} exceeds CPU count ({cpu_count}). "
+              f"Consider using {max(1, cpu_count - 2)} or fewer.\n")
 
     input_path = Path(args.input).resolve()
     if not input_path.exists():
@@ -814,15 +760,15 @@ Examples:
         print(f"Output: organized subfolders alongside source")
     else:
         print(f"Output: same directory as source")
-    if args.threads > 1:
-        print(f"Threads: {args.threads}")
+    if args.workers > 1:
+        print(f"Workers: {args.workers} processes ({cpu_count} cores available)")
     if args.extract_images and have_pdfimages:
         print(f"Fallback extractor: pdfimages available")
     if args.dry_run:
         print("=== DRY RUN MODE ===")
     print()
 
-    # Initialize reference log (writes incrementally)
+    # Initialize reference log
     ref_log = None
     if not args.dry_run:
         if output_dir:
@@ -831,79 +777,75 @@ Examples:
             log_dir = input_path if input_path.is_dir() else input_path.parent
         ref_log = ReferenceLog(log_dir, append=args.resume)
 
-    # Stats
+    # Stats (main process only, no locking needed)
     stats = {"processed": 0, "skipped": 0, "errors": 0,
              "split_pages": 0, "images": 0, "img_errors": 0}
-    stats_lock = threading.Lock()
-    printer = Printer()
     interrupted = False
 
+    # ===================================================================
     # Process files
-    if args.threads == 1:
-        # Single-threaded: simple loop
+    # ===================================================================
+    if args.workers == 1:
+        # Single process: simple loop
         for filepath in pdf_files:
             try:
-                process_worker(
+                result = process_pdf(
                     filepath, do_split=args.split, do_images=args.extract_images,
                     output_dir=output_dir, organize=args.organize,
                     dry_run=args.dry_run, have_pdfimages=have_pdfimages,
-                    ref_log=ref_log, printer=printer,
-                    stats_lock=stats_lock, stats=stats,
                 )
+                handle_result(result, ref_log, output_dir, args.organize, stats)
             except KeyboardInterrupt:
                 print("\n\nInterrupted — stopping gracefully...")
                 interrupted = True
                 break
     else:
-        # Multi-threaded with graceful shutdown
-        shutdown_event = threading.Event()
+        # Multi-process with graceful shutdown
+        shutdown = False
 
         def signal_handler(signum, frame):
-            nonlocal interrupted
+            nonlocal interrupted, shutdown
             if not interrupted:
                 interrupted = True
-                shutdown_event.set()
+                shutdown = True
                 print("\n\nInterrupted — finishing in-progress files, please wait...")
             else:
-                # Second Ctrl+C: force exit
                 print("\nForce quit.")
                 os._exit(1)
 
         original_handler = signal.signal(signal.SIGINT, signal_handler)
 
         try:
-            with ThreadPoolExecutor(max_workers=args.threads) as executor:
-                # Submit files in batches so we can stop submitting on interrupt
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                # Submit all files
                 futures = {}
                 for filepath in pdf_files:
-                    if shutdown_event.is_set():
+                    if shutdown:
                         break
                     future = executor.submit(
-                        process_worker,
+                        process_pdf,
                         filepath, args.split, args.extract_images,
                         output_dir, args.organize,
                         args.dry_run, have_pdfimages,
-                        ref_log, printer, stats_lock, stats,
                     )
                     futures[future] = filepath
 
-                # Wait for submitted futures
+                # Collect results as they complete
+                # handle_result runs in main process — no sharing issues
                 for future in as_completed(futures):
-                    if shutdown_event.is_set():
-                        # Cancel any pending futures
+                    if shutdown:
                         for f in futures:
                             f.cancel()
                         break
                     filepath = futures[future]
                     try:
-                        future.result()
+                        result = future.result()
+                        handle_result(result, ref_log, output_dir, args.organize, stats)
                     except Exception as e:
-                        printer.print(f"  [FATAL] {filepath.name} — unhandled exception: {e}")
-                        with stats_lock:
-                            stats["errors"] += 1
+                        print(f"  [FATAL] {filepath.name} — unhandled exception: {e}")
+                        stats["errors"] += 1
 
-                # If interrupted, cancel remaining and don't wait
-                if shutdown_event.is_set():
+                if shutdown:
                     executor.shutdown(wait=False, cancel_futures=True)
         finally:
             signal.signal(signal.SIGINT, original_handler)
