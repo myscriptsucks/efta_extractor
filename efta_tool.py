@@ -40,7 +40,7 @@ Other:
   --dry-run           Preview without making changes.
   -r, --recursive     Search subdirectories recursively.
   --resume            Skip files already processed (auto-detects from output).
-  --workers N         Process N files in parallel using multiple CPU cores (default: 1).
+  --workers N         Process N files in parallel (default: 1).
 
 Requirements:
   pip install pypdf Pillow
@@ -66,7 +66,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -672,7 +672,7 @@ Examples:
     )
     parser.add_argument(
         "--workers", type=int, default=1,
-        help=f"Number of parallel worker processes (default: 1). "
+        help=f"Number of parallel worker threads (default: 1). "
              f"Your system has {os.cpu_count()} cores.",
     )
     args = parser.parse_args()
@@ -761,7 +761,7 @@ Examples:
     else:
         print(f"Output: same directory as source")
     if args.workers > 1:
-        print(f"Workers: {args.workers} processes ({cpu_count} cores available)")
+        print(f"Workers: {args.workers} threads ({cpu_count} cores available)")
     if args.extract_images and have_pdfimages:
         print(f"Fallback extractor: pdfimages available")
     if args.dry_run:
@@ -816,7 +816,7 @@ Examples:
         original_handler = signal.signal(signal.SIGINT, signal_handler)
 
         try:
-            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
                 # Submit all files
                 futures = {}
                 for filepath in pdf_files:

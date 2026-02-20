@@ -203,7 +203,7 @@ python efta_tool.py <input> [options]
 | `--extract-images` | Extract all embedded images in native format |
 | `-r`, `--recursive` | Search subdirectories recursively for EFTA PDFs |
 | `--resume` | Skip files that already have output in the destination |
-| `--workers N` | Process N files in parallel across CPU cores (default: 1) |
+| `--workers N` | Process N files in parallel (default: 1) |
 | `--output-dir PATH` | Send all output to a specific directory |
 | `--organize` | Create a subfolder per EFTA number alongside the source |
 | `--dry-run` | Preview what would happen without making changes |
@@ -291,7 +291,7 @@ python efta_tool.py /path/to/pdfs --extract-images --workers 8
 python efta_tool.py /path/to/pdfs --split --extract-images --workers 4 --resume
 ```
 
-Each worker is a separate process with its own CPU core — true parallel execution, not limited by Python's GIL. Worker count should generally be `cpu_count - 2` or less to avoid choking system resources. The script will warn you if you exceed your core count.
+Each worker runs in its own thread, overlapping disk I/O across multiple files simultaneously. For disk-bound workloads (which this typically is), 8–16 workers is a good starting point. The script will warn you if you exceed your core count.
 
 ---
 
