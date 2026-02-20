@@ -34,7 +34,14 @@ EFTA00000004.pdf
 
 Brackets and sequential numbering are only added when a page contains more than one embedded image.
 
-The tool extracts images using **pypdf** as the primary method. For JPEG and JPEG2000 images, raw stream bytes are written directly, preserving original quality and metadata exactly. For other encodings, images are decoded via PIL and saved in an appropriate format. If pypdf can't decode an image, **pdfimages** (poppler) is used as an optional fallback.
+The tool supports two image extraction engines, selectable with `--engine`:
+
+| Engine | Flag | Speed | File Size | Fidelity |
+|---|---|---|---|---|
+| **fitz** (default) | `--engine fitz` | Slower | Smaller | Original bytes, original DPI |
+| **pypdf** | `--engine pypdf` | Faster | ~50% larger | Re-encoded non-JPEG, 72 DPI |
+
+Both engines extract JPEG/JP2 images identically (raw bytes). The difference is in how non-JPEG images (PNG, TIFF) are handled: fitz pulls the original compressed stream, while pypdf decodes and re-encodes through PIL.
 
 ### Combined Mode
 
@@ -91,99 +98,13 @@ pip install -r requirements.txt
 Or manually:
 
 ```bash
-pip install pypdf Pillow
+pip install PyMuPDF pypdf
 ```
 
-### Optional: poppler-utils
+- **PyMuPDF** — used for image extraction (true extraction, preserves original bytes)
+- **pypdf** — used for page splitting
 
-**poppler-utils** provides `pdfimages`, used as a fallback image extractor for images that pypdf can't decode (certain CCITT fax, JBIG2, or unusual color space encodings). The tool works fine without it for most files. Install it if you see extraction failures.
-
-#### Linux
-
-```bash
-# Arch / CachyOS / Manjaro
-sudo pacman -S poppler
-
-# Debian / Ubuntu / Mint
-sudo apt install poppler-utils
-
-# Fedora / RHEL
-sudo dnf install poppler-utils
-
-# openSUSE
-sudo zypper install poppler-tools
-```
-
-`pdfimages` will be available immediately — no PATH changes needed.
-
-#### macOS
-
-```bash
-brew install poppler
-```
-
-#### Windows
-
-Poppler does not have an official Windows installer. Use one of these methods:
-
-**Option A — Conda (easiest if you use Anaconda/Miniconda):**
-
-```powershell
-conda install -c conda-forge poppler
-```
-
-This handles PATH automatically within the conda environment.
-
-**Option B — Manual install:**
-
-1. Download the latest poppler release for Windows from:
-   https://github.com/osber/poppler-builds/releases
-   (or search "poppler windows builds" — the Release-XX.XX.X-X.zip file)
-
-2. Extract the ZIP to a permanent location, e.g.:
-   ```
-   C:\poppler\
-   ```
-
-3. Add poppler's `bin` directory to your system PATH:
-   - Open **Start** → search **"Environment Variables"** → click **"Edit the system environment variables"**
-   - Click **Environment Variables...**
-   - Under **System variables**, find `Path` and click **Edit**
-   - Click **New** and add:
-     ```
-     C:\poppler\Library\bin
-     ```
-     (adjust if your extracted folder structure differs — look for the folder containing `pdfimages.exe`)
-   - Click **OK** on all dialogs
-
-4. Open a **new** terminal and verify:
-   ```powershell
-   pdfimages -v
-   ```
-   You should see something like `pdfimages version 24.02.0`.
-
-**Option C — Scoop package manager:**
-
-```powershell
-scoop install poppler
-```
-
-**Option D — MSYS2:**
-
-```bash
-pacman -S mingw-w64-x86_64-poppler
-```
-The binary will be in your MSYS2 `bin` directory, which MSYS2 adds to PATH within its shell.
-
-#### Verifying the Install
-
-On any platform, confirm it's working:
-
-```bash
-pdfimages -v
-```
-
-If the tool can't find `pdfimages` at runtime, it will print nothing — pypdf handles extraction on its own. You only need poppler if you encounter images that pypdf can't extract.
+Pillow and poppler-utils are no longer required.
 
 ---
 

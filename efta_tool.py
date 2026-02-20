@@ -41,10 +41,13 @@ Other:
   -r, --recursive     Search subdirectories recursively.
   --resume            Skip files already processed (auto-detects from output).
   --workers N         Process N files in parallel (default: 1).
+  --engine fitz|pypdf Image extraction backend (default: fitz).
+                      fitz:  true extraction, original bytes/DPI, smaller files.
+                      pypdf: faster, re-encodes non-JPEG (larger files, 72 DPI).
 
 Requirements:
-  pip install pypdf Pillow
-  Optional: sudo apt install poppler-utils  (fallback for stubborn images)
+  pip install PyMuPDF pypdf
+  Optional for --engine pypdf: pip install Pillow
 
 Examples:
   python efta_tool.py /path/to/pdfs --split
@@ -54,6 +57,7 @@ Examples:
   python efta_tool.py /path/to/pdfs --split -r
   python efta_tool.py /path/to/pdfs --extract-images --resume
   python efta_tool.py /path/to/pdfs --extract-images --workers 8
+  python efta_tool.py /path/to/pdfs --extract-images --engine pypdf --workers 16
 """
 
 import argparse
@@ -63,7 +67,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -71,6 +74,19 @@ from datetime import datetime
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
+
+# Optional imports — checked at runtime based on --engine
+try:
+    import fitz
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 
 EFTA_PATTERN = re.compile(r'^(EFTA)(\d{8})\.pdf$', re.IGNORECASE)
@@ -97,7 +113,6 @@ def build_stem(prefix: str, number: int) -> str:
 
 
 def ensure_dir(path: Path):
-    """Create directory, handling edge cases gracefully."""
     if path.is_dir():
         return
     if path.exists():
@@ -120,10 +135,7 @@ def resolve_output_dir(source_pdf: Path, output_dir: Path | None,
 
 def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
                         organize: bool) -> set[str]:
-    """Determine which source PDFs already have output. Returns filenames to skip."""
     skip_files = set()
-
-    # Build a set of dirs to scan
     dirs_to_scan = set()
     file_to_check = {}
     for filepath in pdf_files:
@@ -134,9 +146,8 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
         check_dir = resolve_output_dir(filepath, output_dir, organize, prefix, base_number)
         dirs_to_scan.add(check_dir)
         stem = build_stem(prefix, base_number)
-        file_to_check[filepath.name] = (stem, build_stem(prefix, base_number + 1))
+        file_to_check[filepath.name] = stem
 
-    # Scan all relevant dirs once
     existing_stems = set()
     for d in dirs_to_scan:
         if not d.is_dir():
@@ -149,8 +160,7 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
         except PermissionError:
             continue
 
-    # Check each source against existing
-    for fname, (stem, next_stem) in file_to_check.items():
+    for fname, stem in file_to_check.items():
         if stem in existing_stems:
             skip_files.add(fname)
 
@@ -158,12 +168,10 @@ def detect_resume_point(pdf_files: list[Path], output_dir: Path | None,
 
 
 # ---------------------------------------------------------------------------
-# Reference log — CSV append, JSON at end
+# Reference log
 # ---------------------------------------------------------------------------
 
 class ReferenceLog:
-    """Appends to CSV during run, generates JSON at end."""
-
     FIELDNAMES = ["output_file", "type", "parent_document", "page", "source_pages"]
 
     def __init__(self, log_dir: Path, append: bool = False):
@@ -187,7 +195,6 @@ class ReferenceLog:
                 pass
 
     def add(self, new_records: list[dict]):
-        """Append new rows to CSV."""
         if not new_records:
             return
         try:
@@ -200,7 +207,6 @@ class ReferenceLog:
             pass
 
     def finalize(self):
-        """Generate JSON from the CSV. Call once at the end."""
         try:
             records = []
             with open(self.csv_path, "r", encoding="utf-8") as f:
@@ -229,7 +235,58 @@ class ReferenceLog:
 
 
 # ---------------------------------------------------------------------------
-# Image extraction
+# Image extraction — fitz (PyMuPDF): true extraction, preserves original bytes
+# ---------------------------------------------------------------------------
+
+def extract_images_fitz(filepath: Path, page_index: int,
+                        efta_stem: str, dest_dir: Path) -> list[str]:
+    """
+    Extract all embedded images from a single page using PyMuPDF.
+    Writes the raw image bytes as stored in the PDF — no decoding/re-encoding.
+
+    Single image  → EFTA########.ext
+    Multiple      → EFTA########[1].ext, EFTA########[2].ext, ...
+    """
+    extracted = []
+    try:
+        doc = fitz.open(str(filepath))
+        page = doc[page_index]
+        images = page.get_images(full=True)
+
+        if not images:
+            doc.close()
+            return []
+
+        multi = len(images) > 1
+
+        for idx, img_info in enumerate(images, start=1):
+            xref = img_info[0]
+            try:
+                img_data = doc.extract_image(xref)
+                ext = f".{img_data['ext']}"
+                raw_bytes = img_data["image"]
+
+                if multi:
+                    final_name = f"{efta_stem}[{idx}]{ext}"
+                else:
+                    final_name = f"{efta_stem}{ext}"
+
+                output_path = dest_dir / final_name
+                with open(str(output_path), "wb") as f:
+                    f.write(raw_bytes)
+                extracted.append(final_name)
+            except Exception:
+                continue
+
+        doc.close()
+    except Exception:
+        pass
+
+    return extracted
+
+
+# ---------------------------------------------------------------------------
+# Image extraction — pypdf: faster, but re-encodes non-JPEG images
 # ---------------------------------------------------------------------------
 
 def get_image_ext(filter_name: str) -> str:
@@ -245,6 +302,10 @@ def get_image_ext(filter_name: str) -> str:
 
 
 def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
+    """
+    Extract images using pypdf. JPEG/JP2 are written as raw bytes (lossless).
+    Other formats are decoded and re-encoded via PIL (larger files, 72 DPI).
+    """
     image_objects = []
     try:
         resources = page.get("/Resources")
@@ -276,13 +337,16 @@ def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
             final_name = f"{efta_stem}[{idx}]{ext}" if multi else f"{efta_stem}{ext}"
             output_path = dest_dir / final_name
 
+            # JPEG/JP2: raw bytes (identical to fitz for these formats)
             if filter_name in ("/DCTDecode", "/JPXDecode"):
                 with open(str(output_path), "wb") as f:
                     f.write(obj._data)
                 extracted.append(final_name)
                 continue
 
-            from PIL import Image
+            # Other formats: decode via PIL
+            if not HAS_PIL:
+                continue
 
             width = int(obj["/Width"])
             height = int(obj["/Height"])
@@ -317,45 +381,8 @@ def extract_images_pypdf(page, efta_stem: str, dest_dir: Path) -> list[str]:
     return extracted
 
 
-def extract_images_pdfimages(pdf_path: Path, efta_stem: str, dest_dir: Path) -> list[str]:
-    extracted = []
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_prefix = os.path.join(tmpdir, "img")
-            subprocess.run(
-                ["pdfimages", "-all", str(pdf_path), tmp_prefix],
-                capture_output=True, timeout=30,
-            )
-            candidates = sorted(Path(tmpdir).glob("img-*"))
-
-            if len(candidates) == 1:
-                src = candidates[0]
-                final_name = f"{efta_stem}{src.suffix}"
-                shutil.move(str(src), str(dest_dir / final_name))
-                extracted.append(final_name)
-            else:
-                for idx, src in enumerate(candidates, start=1):
-                    ext = src.suffix
-                    final_name = f"{efta_stem}[{idx}]{ext}"
-                    shutil.move(str(src), str(dest_dir / final_name))
-                    extracted.append(final_name)
-    except Exception:
-        pass
-    return extracted
-
-
-def extract_images(page, pdf_path: Path, efta_stem: str,
-                   dest_dir: Path, have_pdfimages: bool) -> list[str]:
-    result = extract_images_pypdf(page, efta_stem, dest_dir)
-    if result:
-        return result
-    if have_pdfimages:
-        return extract_images_pdfimages(pdf_path, efta_stem, dest_dir)
-    return []
-
-
 # ---------------------------------------------------------------------------
-# Core: process a single PDF (runs in worker process)
+# Core: process a single PDF
 # ---------------------------------------------------------------------------
 
 def check_pdf_conflicts(dest_dir: Path, prefix: str, base_number: int,
@@ -370,7 +397,7 @@ def check_pdf_conflicts(dest_dir: Path, prefix: str, base_number: int,
 
 def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 output_dir: Path | None, organize: bool,
-                dry_run: bool, have_pdfimages: bool) -> dict:
+                dry_run: bool, engine: str = "fitz") -> dict:
     """Process a single EFTA PDF. Returns a serializable result dict."""
     filename = filepath.name
     parsed = parse_efta_filename(filename)
@@ -420,6 +447,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
             }
 
         try:
+            # Write pages 2+ first
             for i in range(1, page_count):
                 writer = PdfWriter()
                 writer.add_page(reader.pages[i])
@@ -431,13 +459,17 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
 
                 if do_images:
                     stem = build_stem(prefix, base_number + i)
-                    imgs = extract_images(reader.pages[i], out_path, stem,
-                                          dest_dir, have_pdfimages)
+                    if engine == "fitz":
+                        imgs = extract_images_fitz(out_path, 0, stem, dest_dir)
+                    else:
+                        tmp_reader = PdfReader(str(out_path))
+                        imgs = extract_images_pypdf(tmp_reader.pages[0], stem, dest_dir)
                     if imgs:
                         image_files.extend(imgs)
                     else:
                         img_errors += 1
 
+            # Overwrite original with page 1
             writer = PdfWriter()
             writer.add_page(reader.pages[0])
             page1_path = dest_dir / filename
@@ -452,12 +484,14 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
 
             if do_images:
                 stem = build_stem(prefix, base_number)
-                try:
-                    p1_reader = PdfReader(str(page1_path))
-                    imgs = extract_images(p1_reader.pages[0], page1_path, stem,
-                                          dest_dir, have_pdfimages)
-                except Exception:
-                    imgs = []
+                if engine == "fitz":
+                    imgs = extract_images_fitz(page1_path, 0, stem, dest_dir)
+                else:
+                    try:
+                        p1_reader = PdfReader(str(page1_path))
+                        imgs = extract_images_pypdf(p1_reader.pages[0], stem, dest_dir)
+                    except Exception:
+                        imgs = []
                 if imgs:
                     image_files = imgs + image_files
                 else:
@@ -479,22 +513,24 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
                 page_number = base_number + page_idx
                 stem = build_stem(prefix, page_number)
 
-                if page_count > 1:
-                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                        tmp_path = Path(tmp.name)
-                    try:
-                        tmp_writer = PdfWriter()
-                        tmp_writer.add_page(reader.pages[page_idx])
-                        with open(str(tmp_path), "wb") as f:
-                            tmp_writer.write(f)
-                        imgs = extract_images(reader.pages[page_idx], tmp_path, stem,
-                                              dest_dir, have_pdfimages)
-                    finally:
-                        tmp_path.unlink(missing_ok=True)
+                if engine == "fitz":
+                    imgs = extract_images_fitz(filepath, page_idx, stem, dest_dir)
                 else:
-                    imgs = extract_images(reader.pages[page_idx], filepath, stem,
-                                          dest_dir, have_pdfimages)
-
+                    # pypdf needs per-page access; for multi-page, use temp files
+                    if page_count > 1:
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                            tmp_path = Path(tmp.name)
+                        try:
+                            tmp_writer = PdfWriter()
+                            tmp_writer.add_page(reader.pages[page_idx])
+                            with open(str(tmp_path), "wb") as f:
+                                tmp_writer.write(f)
+                            tmp_reader = PdfReader(str(tmp_path))
+                            imgs = extract_images_pypdf(tmp_reader.pages[0], stem, dest_dir)
+                        finally:
+                            tmp_path.unlink(missing_ok=True)
+                    else:
+                        imgs = extract_images_pypdf(reader.pages[page_idx], stem, dest_dir)
                 if imgs:
                     image_files.extend(imgs)
                 else:
@@ -526,7 +562,7 @@ def process_pdf(filepath: Path, do_split: bool, do_images: bool,
 
 
 # ---------------------------------------------------------------------------
-# Build reference records from a result
+# Build reference records
 # ---------------------------------------------------------------------------
 
 def build_reference_records(result: dict) -> list[dict]:
@@ -572,13 +608,12 @@ def build_reference_records(result: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Handle a result from a worker (runs in main process)
+# Handle a result (runs in main process)
 # ---------------------------------------------------------------------------
 
 def handle_result(result: dict, ref_log: ReferenceLog | None,
                   output_dir: Path | None, organize: bool,
                   stats: dict):
-    """Print result, update stats, write to ref log. Runs in main process."""
     status = result["status"]
 
     if status in ("processed", "dry-run"):
@@ -675,6 +710,12 @@ Examples:
         help=f"Number of parallel worker threads (default: 1). "
              f"Your system has {os.cpu_count()} cores.",
     )
+    parser.add_argument(
+        "--engine", type=str, default="fitz", choices=["fitz", "pypdf"],
+        help="Image extraction engine (default: fitz). "
+             "fitz: true extraction, preserves original bytes/DPI, smaller files. "
+             "pypdf: faster, but re-encodes non-JPEG images (larger files, 72 DPI).",
+    )
     args = parser.parse_args()
 
     if not args.split and not args.extract_images:
@@ -685,6 +726,13 @@ Examples:
 
     if args.workers < 1:
         parser.error("--workers must be at least 1.")
+
+    # Validate engine dependencies
+    if args.engine == "fitz" and not HAS_FITZ:
+        parser.error("--engine fitz requires PyMuPDF. Install with: pip install PyMuPDF")
+    if args.engine == "pypdf" and not HAS_PIL:
+        print("Warning: Pillow not installed. pypdf engine can only extract JPEG/JP2 images.")
+        print("         Install with: pip install Pillow\n")
 
     cpu_count = os.cpu_count() or 1
     if args.workers > cpu_count:
@@ -737,8 +785,6 @@ Examples:
                 print("Nothing left to process.")
                 sys.exit(0)
 
-    have_pdfimages = shutil.which("pdfimages") is not None
-
     # Header
     mode_parts = []
     if args.split:
@@ -762,8 +808,9 @@ Examples:
         print(f"Output: same directory as source")
     if args.workers > 1:
         print(f"Workers: {args.workers} threads ({cpu_count} cores available)")
-    if args.extract_images and have_pdfimages:
-        print(f"Fallback extractor: pdfimages available")
+    if args.extract_images:
+        engine_desc = "fitz (true extraction)" if args.engine == "fitz" else "pypdf (fast, re-encodes)"
+        print(f"Engine: {engine_desc}")
     if args.dry_run:
         print("=== DRY RUN MODE ===")
     print()
@@ -777,7 +824,7 @@ Examples:
             log_dir = input_path if input_path.is_dir() else input_path.parent
         ref_log = ReferenceLog(log_dir, append=args.resume)
 
-    # Stats (main process only, no locking needed)
+    # Stats
     stats = {"processed": 0, "skipped": 0, "errors": 0,
              "split_pages": 0, "images": 0, "img_errors": 0}
     interrupted = False
@@ -786,13 +833,12 @@ Examples:
     # Process files
     # ===================================================================
     if args.workers == 1:
-        # Single process: simple loop
         for filepath in pdf_files:
             try:
                 result = process_pdf(
                     filepath, do_split=args.split, do_images=args.extract_images,
                     output_dir=output_dir, organize=args.organize,
-                    dry_run=args.dry_run, have_pdfimages=have_pdfimages,
+                    dry_run=args.dry_run, engine=args.engine,
                 )
                 handle_result(result, ref_log, output_dir, args.organize, stats)
             except KeyboardInterrupt:
@@ -800,7 +846,6 @@ Examples:
                 interrupted = True
                 break
     else:
-        # Multi-process with graceful shutdown
         shutdown = False
 
         def signal_handler(signum, frame):
@@ -817,7 +862,6 @@ Examples:
 
         try:
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
-                # Submit all files
                 futures = {}
                 for filepath in pdf_files:
                     if shutdown:
@@ -826,12 +870,10 @@ Examples:
                         process_pdf,
                         filepath, args.split, args.extract_images,
                         output_dir, args.organize,
-                        args.dry_run, have_pdfimages,
+                        args.dry_run, args.engine,
                     )
                     futures[future] = filepath
 
-                # Collect results as they complete
-                # handle_result runs in main process — no sharing issues
                 for future in as_completed(futures):
                     if shutdown:
                         for f in futures:
@@ -850,7 +892,7 @@ Examples:
         finally:
             signal.signal(signal.SIGINT, original_handler)
 
-    # Finalize reference log — generate JSON from CSV
+    # Finalize reference log
     if ref_log:
         ref_log.finalize()
 

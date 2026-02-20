@@ -1,2 +1,3 @@
+PyMuPDF>=1.24.0
 pypdf>=4.0.0
-Pillow>=10.0.0
+Pillow>=10.0.0  # optional, only needed for --engine pypdf with non-JPEG images
